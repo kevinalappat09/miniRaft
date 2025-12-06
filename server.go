@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/rpc"
 	"os"
+	"strconv"
 )
 
 type Server struct {
@@ -39,9 +40,26 @@ type AppendEntriesReply struct {
 }
 
 type RequestVotesArgs struct {
+	// candidates term
+	Term int
+	// candidte id
+	Id int
+	// index of candidates last log
+	LastLogIndex int
+	// term of candidates last log
+	LastLogTerm int
 }
 
 type RequestVotesReply struct {
+	// term for candidate to update
+	Term int
+	// true means candidate received the vote
+	VoteGranted bool
+}
+
+func (s *Server) Start(_ struct{}, _ *struct{}) error {
+	go s.raft.runElectionTimer()
+	return nil
 }
 
 func main() {
@@ -51,6 +69,9 @@ func main() {
 	server := new(Server)
 	raft := new(Raft)
 
+	numstr := port[1:]
+	num, _ := strconv.Atoi(numstr)
+	server.id = num % 10
 	server.peers = make([]string, 0)
 	for _, peer := range possible_peers {
 		if peer == port {
@@ -59,12 +80,10 @@ func main() {
 		server.peers = append(server.peers, peer)
 	}
 	server.raft = raft
-
-	raft.server = server
-	raft.currentTerm = 0
+	server.raft.InitializeRaft(server)
 
 	rpc.Register(server)
-	rpc.Register(server.raft)
+	rpc.RegisterName("Raft", server.raft)
 	rpc.HandleHTTP()
 	listener, err := net.Listen("tcp", port)
 	if err != nil {
