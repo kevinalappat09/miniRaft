@@ -15,6 +15,9 @@ type Server struct {
 	port  string
 	peers []string
 	raft  *Raft
+
+	// the actual variable that we want to replicate
+	value int
 }
 
 type AppendEntriesArgs struct {
@@ -57,8 +60,34 @@ type RequestVotesReply struct {
 	VoteGranted bool
 }
 
+type ChangeValueArgs struct {
+	Value int
+}
+
+type ChangeValueReply struct {
+	Success bool
+}
+
+type GetValueArgs struct{}
+
+type GetValueReply struct {
+	Value int
+}
+
 func (s *Server) Start(_ struct{}, _ *struct{}) error {
 	go s.raft.runElectionTimer()
+	return nil
+}
+
+func (s *Server) ChangeValue(args ChangeValueArgs, reply *ChangeValueReply) error {
+	fmt.Printf("[server %d] received request from client:  %d\n", s.id, args.Value)
+	reply.Success = s.raft.handleCommand(args.Value)
+	return nil
+}
+
+func (s *Server) GetValue(args GetValueArgs, reply *GetValueReply) error {
+	fmt.Printf("[server %d] received get value : %d", s.id, s.value)
+	reply.Value = s.value
 	return nil
 }
 

@@ -63,20 +63,53 @@ func (r *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) 
 
 	fmt.Printf("[Server %d] Received append entries from %d (term=%d)\n", r.server.id, args.LeaderId, args.Term)
 
+	// 1. Reply false if leader's term < currentTerm
 	if args.Term < r.currentTerm {
 		reply.Term = r.currentTerm
 		reply.Success = false
 		return nil
 	}
 
+	// 2. If leader's term > currentTerm, update term and become follower
 	if args.Term > r.currentTerm {
 		r.currentTerm = args.Term
-
-		// revert to Follower
 		r.votedFor = -1
 		r.state = "Follower"
 	}
+
+	// 3. Reset election timer
 	r.electionResetTimeout = time.Now()
+
+	// 4. Log consistency check
+	prevIndex := args.PreviousLogIndex
+	prevTerm := args.PreviousLogTerm
+
+	if prevIndex >= 0 {
+		if prevIndex >= len(r.log) || r.log[prevIndex].Term != prevTerm {
+			// Follower log doesn't match leader
+			reply.Term = r.currentTerm
+			reply.Success = false
+			return nil
+		}
+	}
+
+	// 5. Append the new entry only if it’s not a heartbeat (empty entry)
+	if args.Entry != (LogEntry{}) {
+		if prevIndex+1 < len(r.log) {
+			// Conflict: truncate follower log
+			r.log = r.log[:prevIndex+1]
+		}
+		r.log = append(r.log, args.Entry)
+	}
+
+	// 6. Update commit index
+	if args.LeaderCommitIndex > r.commitIndex {
+		newCommit := args.LeaderCommitIndex
+		if newCommit > len(r.log)-1 {
+			newCommit = len(r.log) - 1
+		}
+		r.commit(newCommit)
+	}
 
 	reply.Term = r.currentTerm
 	reply.Success = true
@@ -104,11 +137,11 @@ func (r *Raft) RequestVotes(args RequestVotesArgs, reply *RequestVotesReply) err
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	fmt.Printf("RequestVotes received from server : %d\n", args.Id)
+	fmt.Printf("[server %d] RequestVotes received from server : %d\n", r.server.id, args.Id)
 	if args.Term < r.currentTerm {
 		reply.Term = r.currentTerm
 		reply.VoteGranted = false
-		fmt.Println("\tRejected RequestVotes as current term higher")
+		fmt.Printf("[server %d] Rejected RequestVotes as current term higher\n", r.server.id)
 		return nil
 	}
 
@@ -130,7 +163,7 @@ func (r *Raft) RequestVotes(args RequestVotesArgs, reply *RequestVotesReply) err
 	if !logUpToDate {
 		reply.Term = r.currentTerm
 		reply.VoteGranted = false
-		fmt.Println("\tRejected vote: log not up-to-date")
+		fmt.Printf("[server %d] Rejected vote: log not up-to-date", r.server.id)
 		return nil
 	}
 
@@ -140,12 +173,12 @@ func (r *Raft) RequestVotes(args RequestVotesArgs, reply *RequestVotesReply) err
 
 		reply.Term = r.currentTerm
 		reply.VoteGranted = true
-		fmt.Println("\tAccepted vote")
+		fmt.Printf("[server %d] Accepted vote", r.server.id)
 		return nil
 	}
 	reply.Term = r.currentTerm
 	reply.VoteGranted = false
-	fmt.Println("\tRejected vote: already voted")
+	fmt.Printf("[server %d] Rejected vote: already voted", r.server.id)
 
 	return nil
 }
@@ -292,9 +325,7 @@ func (r *Raft) startElection() {
 	}
 
 	if votes >= majority {
-		r.state = "Leader"
-		fmt.Printf("[server %d] BECAME LEADER for term %d\n", r.server.id, term)
-		r.startHeartbeats()
+		r.becomeLeader(lastIndex, term)
 		r.mu.Unlock()
 		return
 	}
@@ -303,11 +334,21 @@ func (r *Raft) startElection() {
 	r.mu.Unlock()
 }
 
+func (r *Raft) becomeLeader(lastIndex, term int) {
+	r.state = "Leader"
+	for i, _ := range r.server.peers {
+		r.nextIndex[i] = lastIndex + 1
+		r.matchIndex[i] = 0
+	}
+	fmt.Printf("[server %d] BECAME LEADER for term %d\n", r.server.id, term)
+	r.startHeartbeats()
+}
+
 func (r *Raft) becomeFollower() {
 	r.votedFor = -1
 	r.electionResetTimeout = time.Now()
 	r.state = "Follower"
-	fmt.Println("Becoming Follower")
+	fmt.Printf("[server %d] Becoming Follower\n", r.server.id)
 }
 
 func (r *Raft) sendHeartbeats() {
@@ -318,20 +359,30 @@ func (r *Raft) sendHeartbeats() {
 	}
 
 	term := r.currentTerm
+	commitIndex := r.commitIndex
 	r.mu.Unlock()
 
-	for _, peer := range r.server.peers {
-		go func(peer string) {
+	for idx, peer := range r.server.peers {
+		go func(peer string, idx int) {
+			r.mu.Lock()
+			prevIndex := r.nextIndex[idx] - 1
+			prevTerm := 0
+			if prevIndex >= 0 && prevIndex < len(r.log) {
+				prevTerm = r.log[prevIndex].Term
+			}
+			r.mu.Unlock()
+
 			args := &AppendEntriesArgs{
 				Term:              term,
 				LeaderId:          r.server.id,
-				PreviousLogIndex:  -1,
-				PreviousLogTerm:   0,
-				Entry:             LogEntry{},
-				LeaderCommitIndex: 0,
+				PreviousLogIndex:  prevIndex,
+				PreviousLogTerm:   prevTerm,
+				Entry:             LogEntry{}, // empty = heartbeat
+				LeaderCommitIndex: commitIndex,
 			}
+
 			_, _ = r.callAppendEntries(peer, *args)
-		}(peer)
+		}(peer, idx)
 	}
 }
 
@@ -346,7 +397,6 @@ func (r *Raft) startHeartbeats() {
 				r.mu.Unlock()
 				return
 			}
-
 			r.mu.Unlock()
 
 			r.sendHeartbeats()
@@ -354,10 +404,154 @@ func (r *Raft) startHeartbeats() {
 	}()
 }
 
+func (r *Raft) commit(commitIndex int) {
+	fmt.Printf("[server %d] commit() called with commitIndex=%d (current commitIndex=%d lastApplied=%d)\n",
+		r.server.id, commitIndex, r.commitIndex, r.lastApplied)
+
+	// do not commit entries already committed
+	if commitIndex <= r.commitIndex {
+		fmt.Printf("[server %d] Already committed up to %d, nothing to do\n", r.server.id, r.commitIndex)
+		return
+	}
+
+	// clamp to last valid log index
+	if commitIndex > len(r.log)-1 {
+		fmt.Printf("[server %d] commitIndex %d > maxLogIndex %d, adjusting\n",
+			r.server.id, commitIndex, len(r.log)-1)
+		commitIndex = len(r.log) - 1
+	}
+
+	fmt.Printf("[server %d] Applying log entries from %d to %d\n",
+		r.server.id, r.lastApplied+1, commitIndex)
+
+	// apply all entries including commitIndex
+	for i := r.lastApplied + 1; i <= commitIndex; i++ {
+		entry := r.log[i]
+		r.server.value = entry.Command
+		fmt.Printf("[server %d] **APPLIED** log[%d] = %d (term %d)\n",
+			r.server.id, i, entry.Command, entry.Term)
+		r.lastApplied = i
+	}
+
+	r.commitIndex = commitIndex
+	fmt.Printf("[server %d] commitIndex updated to %d\n", r.server.id, r.commitIndex)
+}
+
+func (r *Raft) handleCommand(command int) bool {
+	fmt.Printf("[server %d] handleCommand called with value %d\n", r.server.id, command)
+
+	r.mu.Lock()
+	// Step 1: append new log entry
+	logEntry := LogEntry{
+		Term:    r.currentTerm,
+		Command: command,
+	}
+	r.log = append(r.log, logEntry)
+	index := len(r.log) - 1
+	term := r.currentTerm
+	fmt.Printf("[server %d] Appended log entry at index %d with term %d\n", r.server.id, index, term)
+	r.mu.Unlock()
+
+	var wg sync.WaitGroup
+
+	for idx, peer := range r.server.peers {
+		wg.Add(1)
+		go func(peer string, idx int) {
+			defer wg.Done()
+			for {
+				r.mu.Lock()
+				nextIdx := r.nextIndex[idx]
+				prevLogIndex := nextIdx - 1
+				prevLogTerm := 0
+				if prevLogIndex >= 0 && prevLogIndex < len(r.log) {
+					prevLogTerm = r.log[prevLogIndex].Term
+				}
+				entries := r.log[nextIdx:]
+				r.mu.Unlock()
+
+				fmt.Printf("[server %d] Sending AppendEntries to peer %s: prevLogIndex=%d, prevLogTerm=%d, entriesLen=%d\n",
+					r.server.id, peer, prevLogIndex, prevLogTerm, len(entries))
+
+				args := &AppendEntriesArgs{
+					Term:              r.currentTerm,
+					LeaderId:          r.server.id,
+					PreviousLogIndex:  prevLogIndex,
+					PreviousLogTerm:   prevLogTerm,
+					Entry:             logEntry,
+					LeaderCommitIndex: r.commitIndex,
+				}
+
+				success, reply := r.callAppendEntries(peer, *args)
+				if !success {
+					fmt.Printf("[server %d] AppendEntries RPC failed to %s\n", r.server.id, peer)
+					time.Sleep(50 * time.Millisecond)
+					continue
+				}
+
+				r.mu.Lock()
+				if reply.Term > term {
+					fmt.Printf("[server %d] Peer %s has higher term %d, stepping down from term %d\n",
+						r.server.id, peer, reply.Term, term)
+					r.currentTerm = reply.Term
+					r.becomeFollower()
+					r.mu.Unlock()
+					return
+				}
+
+				if reply.Success {
+					r.nextIndex[idx] = nextIdx + len(entries)
+					r.matchIndex[idx] = r.nextIndex[idx] - 1
+					fmt.Printf("[server %d] AppendEntries to %s succeeded: nextIndex=%d, matchIndex=%d\n",
+						r.server.id, peer, r.nextIndex[idx], r.matchIndex[idx])
+					r.mu.Unlock()
+					break
+				} else {
+					fmt.Printf("[server %d] AppendEntries to %s failed due to log inconsistency, decrementing nextIndex from %d\n",
+						r.server.id, peer, r.nextIndex[idx])
+					if r.nextIndex[idx] > 0 {
+						r.nextIndex[idx]--
+					}
+					r.mu.Unlock()
+				}
+			}
+		}(peer, idx)
+	}
+
+	wg.Wait()
+
+	r.mu.Lock()
+	committed := false
+	count := 1 // leader itself
+	for _, match := range r.matchIndex {
+		if match >= index {
+			count++
+		}
+	}
+	majority := len(r.server.peers)/2 + 1
+	fmt.Printf("[server %d] Checking if log at index %d can be committed: matchCount=%d, majority=%d\n",
+		r.server.id, index, count, majority)
+
+	if count >= majority && r.log[index].Term == r.currentTerm {
+		r.commit(index)
+		fmt.Printf("[server %d] Log at index %d committed, value=%d\n", r.server.id, index, r.log[index].Command)
+		committed = true
+	} else {
+		fmt.Printf("[server %d] Log at index %d not committed yet\n", r.server.id, index)
+	}
+	r.mu.Unlock()
+
+	return committed
+}
+
 func (r *Raft) InitializeRaft(s *Server) {
 	r.server = s
 	r.currentTerm = 0
 	r.state = "Follower"
 	r.votedFor = -1
+	r.commitIndex = -1
+	r.lastApplied = -1
 	r.electionResetTimeout = time.Now()
+
+	r.nextIndex = make([]int, len(r.server.peers))
+	r.matchIndex = make([]int, len(r.server.peers))
 }
